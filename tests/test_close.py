@@ -68,6 +68,7 @@ class TestMountCleanupBugFix:
             cleanup_ref = await mount(coordinator)
 
         provider = coordinator.mounted_provider
+        assert provider is not None, "mount() should have set mounted_provider"
         assert provider._client is None, (
             "Client should not be initialized before cleanup"
         )
