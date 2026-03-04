@@ -200,7 +200,7 @@ class VLLMProvider:
         return self._client
 
     @staticmethod
-    def _is_cloudflare_challenge(error) -> bool:
+    def _is_cloudflare_challenge(error: openai.APIStatusError) -> bool:
         """Detect Cloudflare bot-management challenge responses.
 
         Cloudflare interposes HTML challenge pages (HTTP 403) that look nothing
@@ -228,12 +228,12 @@ class VLLMProvider:
             return True
 
         # Fallback: scan response text for Cloudflare markers
-        text = getattr(response, "text", "") or ""
+        text = (getattr(response, "text", "") or "").lower()
         cf_markers = (
-            "Just a moment",
+            "just a moment",
             "cf-browser-verification",
             "cloudflare",
-            "Checking if the site connection is secure",
+            "checking if the site connection is secure",
         )
         return any(marker in text for marker in cf_markers)
 
