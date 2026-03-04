@@ -14,6 +14,7 @@ import logging
 import os
 import time
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import openai
@@ -404,27 +405,35 @@ class VLLMProvider:
             return [self._truncate_values(item, max_length) for item in obj]
         return obj  # Numbers, booleans, None pass through unchanged
 
-    def _find_missing_tool_results(self, messages: list) -> list[tuple[str, str, dict]]:
+    def _find_missing_tool_results(
+        self, messages: list
+    ) -> list[tuple[int, str, str, dict]]:
         """Find tool calls without matching results.
 
         Scans conversation for assistant tool calls and validates each has
-        a corresponding tool result message. Returns missing pairs.
+        a corresponding tool result message. Returns missing pairs, including
+        the index of the source assistant message so callers can insert
+        synthetic results at the correct position.
 
         Filters out tool call IDs that have already been repaired with synthetic
         results to prevent infinite detection loops across LLM iterations.
 
         Returns:
-            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
+            List of (msg_index, call_id, tool_name, tool_arguments) tuples for
+            unpaired calls, where msg_index is the position of the assistant
+            message that issued the tool call.
         """
-        tool_calls = {}  # {call_id: (name, args)}
-        tool_results = set()  # {call_id}
+        tool_calls: dict[
+            str, tuple[int, str, dict]
+        ] = {}  # {call_id: (msg_idx, name, args)}
+        tool_results: set[str] = set()  # {call_id}
 
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             # Check assistant messages for ToolCallBlock in content
             if msg.role == "assistant" and isinstance(msg.content, list):
                 for block in msg.content:
                     if hasattr(block, "type") and block.type == "tool_call":
-                        tool_calls[block.id] = (block.name, block.input)
+                        tool_calls[block.id] = (msg_idx, block.name, block.input)
 
             # Check tool messages for tool_call_id
             elif (
@@ -434,10 +443,28 @@ class VLLMProvider:
 
         # Exclude IDs that have already been repaired to prevent infinite loops
         return [
-            (call_id, name, args)
-            for call_id, (name, args) in tool_calls.items()
+            (msg_idx, call_id, name, args)
+            for call_id, (msg_idx, name, args) in tool_calls.items()
             if call_id not in tool_results and call_id not in self._repaired_tool_ids
         ]
+
+    def _create_synthetic_assistant_response(self):
+        """Create a synthetic assistant turn to bridge tool results and a following user message.
+
+        This is part of FM3 repair: when synthetic tool results are injected but the very
+        next message is a real user message (not an assistant turn), the conversation
+        violates the expected alternating structure expected by the LLM API.  Inserting
+        this synthetic assistant acknowledgment restores a valid turn sequence.
+        """
+        from amplifier_core.message_models import Message
+
+        return Message(
+            role="assistant",
+            content=(
+                "[SYSTEM REPAIR: Synthetic assistant turn inserted to maintain valid "
+                "conversation structure after missing tool result recovery.]"
+            ),
+        )
 
     def _create_synthetic_result(self, call_id: str, tool_name: str):
         """Create synthetic error result for missing tool response.
@@ -480,15 +507,40 @@ class VLLMProvider:
             logger.warning(
                 f"[PROVIDER] vLLM: Detected {len(missing)} missing tool result(s). "
                 f"Injecting synthetic errors. This indicates a bug in context management. "
-                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+                f"Tool IDs: {[call_id for _, call_id, _, _ in missing]}"
             )
 
-            # Inject synthetic results and track repaired IDs to prevent infinite loops
-            for call_id, tool_name, _ in missing:
-                synthetic = self._create_synthetic_result(call_id, tool_name)
-                request.messages.append(synthetic)
-                # Track this ID so we don't detect it as missing again in future iterations
-                self._repaired_tool_ids.add(call_id)
+            # Group by source assistant message index so we can insert each synthetic
+            # result directly after the message that issued the call, rather than
+            # appending them all at the end of the list (which violates API ordering).
+            by_msg_idx: dict[int, list[tuple[str, str]]] = defaultdict(list)
+            for msg_idx, call_id, tool_name, _ in missing:
+                by_msg_idx[msg_idx].append((call_id, tool_name))
+
+            # Process in reverse index order so inserting into earlier positions
+            # does not shift the indices we will use for later groups.
+            for msg_idx in sorted(by_msg_idx.keys(), reverse=True):
+                synthetics = []
+                for call_id, tool_name in by_msg_idx[msg_idx]:
+                    synthetics.append(self._create_synthetic_result(call_id, tool_name))
+                    # Track this ID so we don't detect it as missing again
+                    self._repaired_tool_ids.add(call_id)
+
+                insert_pos = msg_idx + 1
+                for i, synthetic in enumerate(synthetics):
+                    request.messages.insert(insert_pos + i, synthetic)
+
+                # FM3: if the message immediately following the injected tool results
+                # is a real user message, insert a synthetic assistant acknowledgment
+                # to maintain valid alternating turn structure.
+                next_pos = insert_pos + len(synthetics)
+                if (
+                    next_pos < len(request.messages)
+                    and request.messages[next_pos].role == "user"
+                ):
+                    request.messages.insert(
+                        next_pos, self._create_synthetic_assistant_response()
+                    )
 
             # Emit observability event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -499,7 +551,7 @@ class VLLMProvider:
                         "repair_count": len(missing),
                         "repairs": [
                             {"tool_call_id": call_id, "tool_name": tool_name}
-                            for call_id, tool_name, _ in missing
+                            for _, call_id, tool_name, _ in missing
                         ],
                     },
                 )
