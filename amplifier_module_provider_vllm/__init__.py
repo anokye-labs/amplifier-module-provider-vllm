@@ -103,8 +103,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Return cleanup function
     async def cleanup():
-        if hasattr(provider.client, "close"):
-            await provider.client.close()
+        if provider._client is not None:
+            await provider._client.close()
 
     return cleanup
 
@@ -1733,3 +1733,9 @@ class VLLMProvider:
         )
 
         return chat_response
+
+    async def close(self) -> None:
+        """Close the underlying OpenAI-compatible client to prevent resource leaks."""
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
