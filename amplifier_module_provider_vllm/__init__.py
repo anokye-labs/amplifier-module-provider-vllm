@@ -972,22 +972,6 @@ class VLLMProvider:
 
             logger.info("[PROVIDER] Received response from %s API", self.api_label)
 
-            # RAW level: Complete response object from OpenAI API (if debug AND raw_debug enabled)
-            if (
-                self.coordinator
-                and hasattr(self.coordinator, "hooks")
-                and self.debug
-                and self.raw_debug
-            ):
-                await self.coordinator.hooks.emit(
-                    "llm:response:raw",
-                    {
-                        "lvl": "DEBUG",
-                        "provider": self.name,
-                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
-                    },
-                )
-
             # Handle incomplete responses via auto-continuation
             # OpenAI Responses API may return status="incomplete" with reason like "max_output_tokens"
             # We automatically continue until complete to provide seamless experience
@@ -1081,23 +1065,6 @@ class VLLMProvider:
                     ):
                         accumulated_output.extend(final_response.output)
 
-                    # Emit raw debug for continuation if enabled
-                    if (
-                        self.coordinator
-                        and hasattr(self.coordinator, "hooks")
-                        and self.debug
-                        and self.raw_debug
-                    ):
-                        await self.coordinator.hooks.emit(
-                            "llm:response:raw",
-                            {
-                                "lvl": "DEBUG",
-                                "provider": self.name,
-                                "response": final_response.model_dump(),
-                                "continuation": continuation_count,
-                            },
-                        )
-
                 except Exception as e:
                     logger.error(
                         f"[PROVIDER] Continuation call {continuation_count} failed: {e}. "
@@ -1161,6 +1128,20 @@ class VLLMProvider:
                             if continuation_count > 0
                             else None,
                         },
+                    )
+
+                # RAW level: Complete response object from API (if debug AND raw_debug enabled)
+                if self.debug and self.raw_debug:
+                    raw_payload = {
+                        "lvl": "DEBUG",
+                        "provider": self.name,
+                        "response": response.model_dump(),  # Pydantic model → dict (complete untruncated)
+                    }
+                    if continuation_count > 0:
+                        raw_payload["continuation"] = continuation_count
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        raw_payload,
                     )
 
             # Convert to ChatResponse with accumulated output
